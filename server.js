@@ -1,503 +1,204 @@
+
 'use strict';
 
-/*
- * RainX Server Pro — JSON-only API
- * Node.js >= 20
- * Required env: BOT_SECRET, OWNER_SECRET, SESSION_SECRET
- * Optional env: PORT, DATA_DIR, TRUST_PROXY
- *
- * JSON storage is intended for one server instance.
- * Never commit secrets or rainx-data.json to GitHub.
- */
-
 const express = require('express');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const crypto = require('node:crypto');
-const http = require('node:http');
-const { WebSocketServer } = require('ws');
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocketServer({
-  noServer: true,
-  maxPayload: 2048
-});
-
 app.disable('x-powered-by');
-app.set(
-  'trust proxy',
-  process.env.TRUST_PROXY === '1' ? 1 : false
-);
-app.use(express.json({
-  limit: '128kb',
-  strict: true
-}));
+app.use(express.json({ limit: '64kb' }));
 
 const PORT = Number(process.env.PORT || 3000);
 const BOT_SECRET = process.env.BOT_SECRET || '';
 const OWNER_SECRET = process.env.OWNER_SECRET || '';
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
 
-const DATA_DIR =
-  process.env.DATA_DIR ||
-  process.env.RAILWAY_VOLUME_MOUNT_PATH ||
-  '/data';
-
-const DATA_FILE = path.join(DATA_DIR, 'rainx-data.json');
-const BACKUP_FILE = path.join(DATA_DIR, 'rainx-data.backup.json');
+const DATA_DIR = process.env.DATA_DIR || './data';
+const DATA_FILE = path.join(DATA_DIR, 'rainx.json');
 
 const NOW = () => Math.floor(Date.now() / 1000);
-const MAX_CLOCK_SKEW = 120;
 const CHALLENGE_TTL = 90;
 const SESSION_TTL = 90 * 60;
-const MAX_KEYS_PER_GENERATION = 50;
-const MAX_JSON_BYTES = 32 * 1024 * 1024;
-
-if (!BOT_SECRET || BOT_SECRET.length < 24) {
-  console.error(
-    '[SECURITY] BOT_SECRET missing or shorter than 24 chars.'
-  );
-}
-
-if (!OWNER_SECRET || OWNER_SECRET.length < 24) {
-  console.error(
-    '[SECURITY] OWNER_SECRET missing or shorter than 24 chars.'
-  );
-}
-
-if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
-  console.error(
-    '[SECURITY] SESSION_SECRET must be at least 32 chars.'
-  );
-}
-
-function emptyDb() {
-  return {
-    version: 2,
-    config: {},
-    guildLicenses: {},
-    keys: {},
-    challenges: {},
-    sessions: {},
-    nonceCache: {},
-    audit: []
-  };
-}
-
-let db = emptyDb();
-let saveQueue = Promise.resolve();
-
-const buckets = new Map();
-const wsConnections = new Set();
-
-function safeObject(value) {
-  return !!value &&
-    typeof value === 'object' &&
-    !Array.isArray(value);
-}
 
 function randomHex(bytes = 32) {
   return crypto.randomBytes(bytes).toString('hex');
 }
 
-function randomKey() {
-  return crypto.randomBytes(16)
-    .toString('hex')
-    .toUpperCase();
-}
-
 function sha256(value) {
-  return crypto.createHash('sha256')
-    .update(String(value))
-    .digest('hex');
+  return crypto.createHash('sha256').update(String(value)).digest('hex');
 }
 
-function tokenDigest(value) {
-  return crypto.createHmac(
-    'sha256',
-    SESSION_SECRET || 'missing-session-secret'
-  ).update(String(value)).digest('hex');
+function digestToken(token) {
+  return crypto.createHmac('sha256', SESSION_SECRET)
+    .update(String(token)).digest('hex');
 }
 
-function safeEqual(a, b) {
-  if (
-    typeof a !== 'string' ||
-    typeof b !== 'string' ||
-    !a ||
-    !b
-  ) {
-    return false;
-  }
-
-  const aa = Buffer.from(a);
-  const bb = Buffer.from(b);
-
-  return aa.length === bb.length &&
-    crypto.timingSafeEqual(aa, bb);
+function equalSecret(a, b) {
+  if (!a || !b) return false;
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
-function validId(value) {
-  return typeof value === 'string' &&
-    /^\d{5,25}$/.test(value);
-}
-
-function validKey(value) {
-  return typeof value === 'string' &&
-    /^[A-F0-9]{32}$/.test(value);
-}
-
-function validHwid(value) {
-  return typeof value === 'string' &&
-    /^[A-Za-z0-9_-]{1,128}$/.test(value);
-}
-
-function expired(data) {
-  if (!data || data.active === false) return true;
-  if (data.duration === -1) return false;
-
-  return !data.redeemedAt ||
-    data.redeemedAt <= 0 ||
-    data.redeemedAt + data.duration <= NOW();
-}
-
-function publicKeyData(data) {
+function emptyDB() {
   return {
-    ...data,
-    expired: expired(data),
-    active: data.active !== false
+    version: 1,
+    config: { projectName: 'RainX', maintenance: false },
+    keys: {},
+    challenges: {},
+    sessions: {},
+    nonces: {}
   };
 }
 
-function clientIp(req) {
-  return String(
-    req.ip || req.socket?.remoteAddress || 'unknown'
-  ).slice(0, 100);
-}
+let db = emptyDB();
+let saveQueue = Promise.resolve();
 
-function audit(action, detail = {}) {
-  db.audit.push({
-    at: NOW(),
-    action: String(action).slice(0, 80),
-    detail
-  });
-
-  if (db.audit.length > 500) {
-    db.audit.splice(0, db.audit.length - 500);
-  }
-}
-
-function loadDb() {
+function loadDB() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
-  for (const candidate of [DATA_FILE, BACKUP_FILE]) {
-    try {
-      if (!fs.existsSync(candidate)) continue;
-
-      const stat = fs.statSync(candidate);
-
-      if (stat.size > MAX_JSON_BYTES) {
-        throw new Error('JSON file exceeds size limit');
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const loaded = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      if (!loaded || typeof loaded !== 'object' || Array.isArray(loaded)) {
+        throw new Error('Invalid database');
       }
-
-      const parsed = JSON.parse(
-        fs.readFileSync(candidate, 'utf8')
-      );
-
-      if (!safeObject(parsed)) {
-        throw new Error('invalid JSON root');
+      db = { ...emptyDB(), ...loaded };
+      for (const key of ['config', 'keys', 'challenges', 'sessions', 'nonces']) {
+        if (!db[key] || typeof db[key] !== 'object' || Array.isArray(db[key])) {
+          db[key] = {};
+        }
       }
-
-      db = { ...emptyDb(), ...parsed };
-
-      for (const key of [
-        'config',
-        'guildLicenses',
-        'keys',
-        'challenges',
-        'sessions',
-        'nonceCache'
-      ]) {
-        if (!safeObject(db[key])) db[key] = {};
-      }
-
-      if (!Array.isArray(db.audit)) db.audit = [];
-
-      console.log(`[storage] Loaded ${candidate}`);
-      return;
-    } catch (error) {
-      console.error(
-        `[storage] Could not load ${candidate}: ${error.message}`
-      );
     }
+  } catch (error) {
+    console.error('Database load error:', error.message);
+    throw error;
   }
-
-  db = emptyDb();
-
-  saveDb().catch(error => {
-    console.error(
-      '[storage] Initial save failed:',
-      error.message
-    );
-  });
 }
 
-function saveDb() {
+function saveDB() {
   saveQueue = saveQueue.catch(() => {}).then(() => {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-
-    const body = JSON.stringify(db, null, 2);
-
-    if (Buffer.byteLength(body) > MAX_JSON_BYTES) {
-      throw new Error('storage limit reached');
-    }
-
-    const tmp = `${DATA_FILE}.${process.pid}.tmp`;
-    const fd = fs.openSync(tmp, 'w', 0o600);
-
-    try {
-      fs.writeFileSync(fd, body, 'utf8');
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-
-    if (fs.existsSync(DATA_FILE)) {
-      try {
-        fs.copyFileSync(DATA_FILE, BACKUP_FILE);
-        fs.chmodSync(BACKUP_FILE, 0o600);
-      } catch {}
-    }
-
-    fs.renameSync(tmp, DATA_FILE);
-
-    try {
-      fs.chmodSync(DATA_FILE, 0o600);
-    } catch {}
+    const temp = DATA_FILE + '.tmp';
+    fs.writeFileSync(temp, JSON.stringify(db, null, 2), { mode: 0o600 });
+    fs.renameSync(temp, DATA_FILE);
   });
-
   return saveQueue;
 }
 
-function rateLimit({
-  windowMs = 60_000,
-  max = 60,
-  keyFn = req => clientIp(req)
-} = {}) {
-  return (req, res, next) => {
-    const key = `${keyFn(req)}:${req.path}`;
-    const now = Date.now();
-
-    let bucket = buckets.get(key);
-
-    if (!bucket || now >= bucket.resetAt) {
-      bucket = {
-        count: 0,
-        resetAt: now + windowMs
-      };
-    }
-
-    bucket.count++;
-    buckets.set(key, bucket);
-
-    if (bucket.count > max) {
-      res.set(
-        'Retry-After',
-        String(Math.max(
-          1,
-          Math.ceil((bucket.resetAt - now) / 1000)
-        ))
-      );
-
-      return res.status(429).json({
-        ok: false,
-        error: 'rate_limited'
-      });
-    }
-
-    next();
-  };
+function validKey(key) {
+  return typeof key === 'string' && /^[A-F0-9]{32}$/.test(key);
 }
 
-function requireSecret(header, expected) {
+function validHwid(hwid) {
+  return typeof hwid === 'string' &&
+    /^[A-Za-z0-9_-]{1,128}$/.test(hwid);
+}
+
+function validClock(ts) {
+  return Number.isInteger(ts) && Math.abs(NOW() - ts) <= 120;
+}
+
+function keyExpired(key) {
+  if (!key || key.active === false) return true;
+  if (!key.redeemedAt) return false;
+  if (key.duration === -1) return false;
+  return NOW() >= key.redeemedAt + key.duration;
+}
+
+function keyFailure(key, hwid) {
+  if (!key || key.active === false) return 'key';
+  if (keyExpired(key)) return 'exp';
+  if (!key.redeemedAt) return 'key';
+  if (key.hwid && key.hwid !== hwid) return 'hwid';
+  return null;
+}
+
+function cleanup() {
+  const now = NOW();
+
+  for (const [id, item] of Object.entries(db.challenges)) {
+    if (!item || item.expiresAt <= now) delete db.challenges[id];
+  }
+
+  for (const [id, item] of Object.entries(db.sessions)) {
+    if (!item || item.expiresAt <= now || item.revoked) {
+      delete db.sessions[id];
+    }
+  }
+
+  for (const [id, expiry] of Object.entries(db.nonces)) {
+    if (expiry <= now) delete db.nonces[id];
+  }
+}
+
+function requireSecret(name, secret) {
   return (req, res, next) => {
-    if (
-      !expected ||
-      !safeEqual(req.get(header) || '', expected)
-    ) {
+    if (!secret || !equalSecret(req.get(name), secret)) {
       return res.status(401).json({
         ok: false,
         error: 'unauthorized'
       });
     }
-
     next();
   };
 }
 
-const requireBot = requireSecret(
-  'x-bot-secret',
-  BOT_SECRET
-);
+const requireBot = requireSecret('x-bot-secret', BOT_SECRET);
+const requireOwner = requireSecret('x-owner-secret', OWNER_SECRET);
 
-const requireOwner = requireSecret(
-  'x-owner-secret',
-  OWNER_SECRET
-);
+function liveSession(token, hwid) {
+  if (typeof token !== 'string' || token.length > 200) return null;
 
-function validClock(timestamp) {
-  return Number.isInteger(timestamp) &&
-    Math.abs(NOW() - timestamp) <= MAX_CLOCK_SKEW;
-}
+  const session = db.sessions[digestToken(token)];
+  if (!session || session.revoked || session.expiresAt <= NOW()) return null;
+  if (session.hwid !== hwid) return null;
 
-function cleanupEphemeral() {
-  const now = NOW();
-
-  for (const [id, challenge] of Object.entries(db.challenges)) {
-    if (!challenge || challenge.expiresAt <= now) {
-      delete db.challenges[id];
-    }
-  }
-
-  for (const [id, session] of Object.entries(db.sessions)) {
-    if (
-      !session ||
-      session.expiresAt <= now ||
-      session.revoked
-    ) {
-      delete db.sessions[id];
-    }
-  }
-
-  for (const [id, expiry] of Object.entries(db.nonceCache)) {
-    if (!expiry || expiry <= now) {
-      delete db.nonceCache[id];
-    }
-  }
-
-  for (const [key, bucket] of buckets) {
-    if (Date.now() >= bucket.resetAt + 60_000) {
-      buckets.delete(key);
-    }
-  }
-}
-
-setInterval(() => {
-  cleanupEphemeral();
-
-  saveDb().catch(error => {
-    console.error(
-      '[storage] cleanup save failed:',
-      error.message
-    );
-  });
-}, 60_000).unref();
-
-function getKey(raw) {
-  return validKey(raw) ? db.keys[raw] : null;
-}
-
-function getKeyFailure(data, hwid) {
-  if (!data || data.active === false) return 'key';
-  if (expired(data)) return 'exp';
-  if (!data.usedBy || !data.guildId) return 'key';
-  if (data.hwid && data.hwid !== hwid) return 'hwid';
-
-  return null;
-}
-
-function getLiveSession(token, hwid) {
-  if (
-    typeof token !== 'string' ||
-    token.length < 40 ||
-    token.length > 200
-  ) {
-    return null;
-  }
-
-  const session = db.sessions[tokenDigest(token)];
-
-  if (
-    !session ||
-    session.revoked ||
-    session.expiresAt <= NOW() ||
-    session.hwid !== hwid
-  ) {
-    return null;
-  }
-
-  const key = getKey(session.key);
-
-  if (
-    !key ||
-    expired(key) ||
-    key.active === false ||
-    key.hwid !== hwid
-  ) {
-    return null;
-  }
+  const key = db.keys[session.key];
+  if (keyFailure(key, hwid)) return null;
 
   return { session, key };
 }
 
 function customHash(value) {
   let n = Number(value);
-
   if (!Number.isFinite(n) || n < 0) n = 0;
 
   for (let pass = 0; pass < 2; pass++) {
     const v1 = n % 9915 + 4;
-    let v2 = 0;
-    let v3 = 0;
+    let v2 = 0, v3 = 0;
 
     for (let i = 1; i <= 3; i++) {
       v2 = n % 4155 + 3;
-
       if (i % 2 === 1) v2 += 522;
-
       v3 = n % 9996 + 1;
-
       if (v3 % 2 !== 1) v3 *= 3;
     }
 
     const v4 = n % 9999995 + 1 + 13729;
     const v5 = n % 100;
     const v6 = Math.floor((n - v5) / 1000) % 1000;
-
-    const v7 =
-      v5 * v6 +
-      v4 +
-      (n % (419824125 - v4 + v5));
-
+    const v7 = v5 * v6 + v4 + (n % (419824125 - v4 + v5));
     const v8 = n % (v1 * v2 + 9999) + 13729;
 
-    n = (
-      v7 +
-      ((v8 + (v5 * v2 + v6)) % 999999) *
-      (v4 + (v8 % v3))
-    ) % 99999999999;
+    n = (v7 + ((v8 + (v5 * v2 + v6)) % 999999) *
+      (v4 + (v8 % v3))) % 99999999999;
   }
 
   return n;
 }
 
-function encryptGcmJson(obj, hexKey) {
-  // Compatibility with the client using k:sub(1, 32)
-  // as 32 ASCII bytes.
-  const key = Buffer.from(
-    hexKey.slice(0, 32),
-    'utf8'
-  );
-
+function encryptToken(payload, challengeKey) {
+  // Compatible with the paired client that uses the first 32
+  // ASCII characters of challengeKey as the AES-256-GCM key.
+  const aesKey = Buffer.from(challengeKey.slice(0, 32), 'utf8');
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv(
-    'aes-256-gcm',
-    key,
-    iv
-  );
+  const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, iv);
 
   const encrypted = Buffer.concat([
-    cipher.update(JSON.stringify(obj), 'utf8'),
+    cipher.update(JSON.stringify(payload), 'utf8'),
     cipher.final()
   ]);
 
@@ -508,13 +209,15 @@ function encryptGcmJson(obj, hexKey) {
   };
 }
 
-// ----- Basic status -----
+// --------------------------------------------------
+// Public status pages
+// --------------------------------------------------
 
 app.get('/', (_req, res) => {
   res.json({
     name: 'RainX API',
     status: 'running',
-    version: 2
+    version: 3
   });
 });
 
@@ -523,985 +226,372 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/ping', (_req, res) => {
-  res.json({
-    ok: true,
-    time: new Date().toISOString()
-  });
+  res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// ----- Config -----
+app.get('/api/status', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'RainX',
+    version: 3,
+    maintenance: Boolean(db.config.maintenance),
+    endpoints: [
+      '/health',
+      '/api/status',
+      '/cdn-cgi/challenge',
+      '/cdn-cgi/token',
+      '/cdn-cgi/validate',
+      '/cdn-cgi/heartbeat'
+    ]
+  });
+});
 
 app.get('/config', requireBot, (_req, res) => {
-  res.json({
-    ok: true,
-    config: db.config
-  });
+  res.json({ ok: true, config: db.config });
 });
 
-app.post(
-  '/config',
-  requireBot,
-  rateLimit({ max: 120 }),
-  async (req, res) => {
-    if (!safeObject(req.body)) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_body'
-      });
-    }
-
-    const patch = { ...req.body };
-
-    if (Object.keys(patch).length > 100) {
-      return res.status(400).json({
-        ok: false,
-        error: 'too_many_fields'
-      });
-    }
-
-    db.config = {
-      ...db.config,
-      ...patch
-    };
-
-    audit('config.update', {
-      fields: Object.keys(patch).slice(0, 50)
-    });
-
-    try {
-      await saveDb();
-      res.json({ ok: true });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-
-// ----- Discord guild license -----
-
-app.get('/guild/check/:guildId', requireBot, (req, res) => {
-  const id = req.params.guildId;
-  const license = validId(id)
-    ? db.guildLicenses[id]
-    : null;
-
-  if (!license) {
-    return res.json({
-      ok: false,
-      expired: true,
-      note: ''
-    });
+app.post('/config', requireOwner, async (req, res) => {
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    return res.status(400).json({ ok: false, error: 'invalid_body' });
   }
 
-  const ok = license.active !== false &&
-    (
-      license.expiresAt === -1 ||
-      license.expiresAt > NOW()
-    );
-
-  res.json({
-    ok,
-    expired: !ok,
-    expiresAt: license.expiresAt,
-    note: license.note || ''
-  });
+  db.config = { ...db.config, ...req.body };
+  try {
+    await saveDB();
+    res.json({ ok: true, config: db.config });
+  } catch {
+    res.status(500).json({ ok: false, error: 'storage_error' });
+  }
 });
 
-app.post(
-  '/guild/license',
-  requireOwner,
-  rateLimit({ max: 30 }),
-  async (req, res) => {
-    const {
-      guildId,
-      days,
-      note = ''
-    } = req.body || {};
-
-    if (!validId(guildId)) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_guild_id'
-      });
-    }
-
-    if (
-      !Number.isInteger(days) ||
-      days < 0 ||
-      days > 36500
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_days'
-      });
-    }
-
-    const expiresAt = days === 0
-      ? -1
-      : NOW() + days * 86400;
-
-    db.guildLicenses[guildId] = {
-      expiresAt,
-      note: String(note).slice(0, 300),
-      active: true,
-      createdAt: NOW(),
-      updatedAt: NOW()
-    };
-
-    audit('guild.license.set', {
-      guildId,
-      days
-    });
-
-    try {
-      await saveDb();
-      res.json({ ok: true, expiresAt });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-
-app.post(
-  '/guild/renew',
-  requireOwner,
-  async (req, res) => {
-    const { guildId, days } = req.body || {};
-
-    const license = validId(guildId)
-      ? db.guildLicenses[guildId]
-      : null;
-
-    if (!license) {
-      return res.status(404).json({
-        ok: false,
-        error: 'not_found'
-      });
-    }
-
-    if (
-      !Number.isInteger(days) ||
-      days < 1 ||
-      days > 36500
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_days'
-      });
-    }
-
-    license.expiresAt = license.expiresAt === -1
-      ? -1
-      : Math.max(license.expiresAt, NOW()) +
-        days * 86400;
-
-    license.active = true;
-    license.updatedAt = NOW();
-
-    audit('guild.license.renew', {
-      guildId,
-      days
-    });
-
-    try {
-      await saveDb();
-      res.json({
-        ok: true,
-        expiresAt: license.expiresAt
-      });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-
-app.delete(
-  '/guild/license/:guildId',
-  requireOwner,
-  async (req, res) => {
-    const id = req.params.guildId;
-
-    if (!db.guildLicenses[id]) {
-      return res.json({
-        ok: false,
-        error: 'not_found'
-      });
-    }
-
-    delete db.guildLicenses[id];
-
-    audit('guild.license.delete', {
-      guildId: id
-    });
-
-    try {
-      await saveDb();
-      res.json({ ok: true });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-// ----- Key management API -----
+// --------------------------------------------------
+// Key management (protected bot API)
+// duration: seconds; -1 = permanent
+// --------------------------------------------------
 
 app.get('/keys', requireBot, (_req, res) => {
-  const keys = {};
-
-  for (const [key, data] of Object.entries(db.keys)) {
-    keys[key] = publicKeyData(data);
-  }
-
-  res.json({ ok: true, keys });
+  res.json({ ok: true, keys: db.keys });
 });
 
-app.post(
-  '/keys/generate',
-  requireBot,
-  rateLimit({ max: 30 }),
-  async (req, res) => {
-    const {
+app.post('/keys/generate', requireBot, async (req, res) => {
+  const duration = req.body?.duration;
+  const amount = req.body?.amount ?? 1;
+
+  if (!Number.isInteger(duration) ||
+      (duration !== -1 && (duration < 60 || duration > 3153600000))) {
+    return res.status(400).json({ ok: false, error: 'invalid_duration' });
+  }
+
+  if (!Number.isInteger(amount) || amount < 1 || amount > 50) {
+    return res.status(400).json({ ok: false, error: 'invalid_amount' });
+  }
+
+  const keys = [];
+
+  for (let i = 0; i < amount; i++) {
+    let key;
+    do {
+      key = randomHex(16).toUpperCase();
+    } while (db.keys[key]);
+
+    db.keys[key] = {
+      active: true,
       duration,
-      amount = 1,
-      file = null
-    } = req.body || {};
-
-    if (
-      !Number.isInteger(duration) ||
-      (
-        duration !== -1 &&
-        (duration < 60 || duration > 36500 * 86400)
-      )
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_duration'
-      });
-    }
-
-    if (
-      !Number.isInteger(amount) ||
-      amount < 1 ||
-      amount > MAX_KEYS_PER_GENERATION
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_amount'
-      });
-    }
-
-    if (
-      file !== null &&
-      (typeof file !== 'string' || file.length > 80)
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_file'
-      });
-    }
-
-    const keys = [];
-
-    for (let i = 0; i < amount; i++) {
-      let key;
-
-      do {
-        key = randomKey();
-      } while (db.keys[key]);
-
-      db.keys[key] = {
-        active: true,
-        duration,
-        redeemedAt: 0,
-        executionCount: 0,
-        usedBy: '',
-        guildId: '',
-        hwid: '',
-        file: file || null,
-        lastHwidReset: 0,
-        createdAt: NOW(),
-        updatedAt: NOW(),
-        revokedAt: 0
-      };
-
-      keys.push(key);
-    }
-
-    audit('keys.generate', {
-      amount,
-      duration,
-      file: file || null
-    });
-
-    try {
-      await saveDb();
-      res.json({ ok: true, keys });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-
-app.get('/keys/user/:userId', requireBot, (req, res) => {
-  const userId = req.params.userId;
-  const guildId = String(req.query.guildId || '');
-
-  if (!validId(userId) || !validId(guildId)) {
-    return res.status(400).json({
-      ok: false,
-      error: 'invalid_id'
-    });
-  }
-
-  const pair = Object.entries(db.keys).find(
-    ([, data]) =>
-      data.usedBy === userId &&
-      data.guildId === guildId &&
-      data.active !== false
-  );
-
-  if (!pair) {
-    return res.json({
-      ok: false,
-      error: 'not_found'
-    });
-  }
-
-  res.json({
-    ok: true,
-    key: pair[0],
-    data: publicKeyData(pair[1])
-  });
-});
-
-app.get('/keys/:keyName', requireBot, (req, res) => {
-  const keyName = req.params.keyName;
-  const data = getKey(keyName);
-
-  if (!data) {
-    return res.status(404).json({
-      ok: false,
-      error: 'not_found'
-    });
-  }
-
-  res.json({
-    ok: true,
-    key: keyName,
-    data: publicKeyData(data)
-  });
-});
-
-app.post(
-  '/keys/:keyName/redeem',
-  requireBot,
-  rateLimit({ max: 60 }),
-  async (req, res) => {
-    const keyName = req.params.keyName;
-    const data = getKey(keyName);
-    const { userId, guildId } = req.body || {};
-
-    if (!data || data.active === false) {
-      return res.json({
-        ok: false,
-        reason: 'Key ไม่ถูกต้อง'
-      });
-    }
-
-    if (!validId(userId) || !validId(guildId)) {
-      return res.status(400).json({
-        ok: false,
-        reason: 'Key ไม่ถูกต้อง'
-      });
-    }
-
-    if (expired(data)) {
-      return res.json({
-        ok: false,
-        reason: 'Key หมดอายุแล้ว'
-      });
-    }
-
-    if (data.usedBy && data.usedBy !== userId) {
-      return res.json({
-        ok: false,
-        reason: 'Key used by someone else'
-      });
-    }
-
-    if (data.guildId && data.guildId !== guildId) {
-      return res.json({
-        ok: false,
-        reason: 'Key used in another guild'
-      });
-    }
-
-    if (
-      data.usedBy === userId &&
-      data.guildId === guildId
-    ) {
-      return res.json({
-        ok: false,
-        reason: 'Already redeemed'
-      });
-    }
-
-    data.usedBy = userId;
-    data.guildId = guildId;
-    data.redeemedAt = NOW();
-    data.updatedAt = NOW();
-
-    audit('key.redeem', {
-      keySuffix: keyName.slice(-6),
-      userId,
-      guildId
-    });
-
-    try {
-      await saveDb();
-      res.json({
-        ok: true,
-        duration: data.duration
-      });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-
-app.delete(
-  '/keys/:keyName',
-  requireBot,
-  async (req, res) => {
-    const keyName = req.params.keyName;
-
-    if (!getKey(keyName)) {
-      return res.json({
-        ok: false,
-        error: 'not_found'
-      });
-    }
-
-    for (const [id, session] of Object.entries(db.sessions)) {
-      if (session.key === keyName) {
-        delete db.sessions[id];
-      }
-    }
-
-    delete db.keys[keyName];
-
-    audit('key.delete', {
-      keySuffix: String(keyName).slice(-6)
-    });
-
-    try {
-      await saveDb();
-      res.json({ ok: true });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-
-app.post(
-  '/keys/:keyName/reset-hwid',
-  requireBot,
-  async (req, res) => {
-    const keyName = req.params.keyName;
-    const data = getKey(keyName);
-
-    if (!data) {
-      return res.status(404).json({
-        ok: false,
-        error: 'not_found'
-      });
-    }
-
-    data.hwid = '';
-    data.lastHwidReset = NOW();
-    data.updatedAt = NOW();
-
-    for (const [id, session] of Object.entries(db.sessions)) {
-      if (session.key === keyName) {
-        delete db.sessions[id];
-      }
-    }
-
-    audit('key.hwid.reset', {
-      keySuffix: keyName.slice(-6)
-    });
-
-    try {
-      await saveDb();
-      res.json({ ok: true });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-
-app.post(
-  '/keys/:keyName/revoke',
-  requireBot,
-  async (req, res) => {
-    const keyName = req.params.keyName;
-    const data = getKey(keyName);
-
-    if (!data) {
-      return res.status(404).json({
-        ok: false,
-        error: 'not_found'
-      });
-    }
-
-    data.active = false;
-    data.revokedAt = NOW();
-    data.updatedAt = NOW();
-
-    for (const [id, session] of Object.entries(db.sessions)) {
-      if (session.key === keyName) {
-        delete db.sessions[id];
-      }
-    }
-
-    audit('key.revoke', {
-      keySuffix: keyName.slice(-6)
-    });
-
-    try {
-      await saveDb();
-      res.json({ ok: true });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-
-// ----- Client authorization protocol -----
-
-app.post(
-  '/cdn-cgi/challenge',
-  rateLimit({ windowMs: 60_000, max: 15 }),
-  async (req, res) => {
-    const { key, hwid, ts, nonce } = req.body || {};
-
-    if (SESSION_SECRET.length < 32) {
-      return res.status(503).json({ e: 'rate' });
-    }
-
-    if (!validKey(key)) {
-      return res.status(200).json({ e: 'key' });
-    }
-
-    if (!validHwid(hwid)) {
-      return res.status(200).json({ e: 'key' });
-    }
-
-    if (!validClock(ts)) {
-      return res.status(200).json({ e: 'rate' });
-    }
-
-    if (
-      typeof nonce !== 'string' ||
-      !/^[a-fA-F0-9]{16,64}$/.test(nonce)
-    ) {
-      return res.status(200).json({ e: 'rate' });
-    }
-
-    const nonceId = sha256(`${clientIp(req)}:${nonce}`);
-
-    if (
-      db.nonceCache[nonceId] &&
-      db.nonceCache[nonceId] > NOW()
-    ) {
-      return res.status(200).json({ e: 'rate' });
-    }
-
-    db.nonceCache[nonceId] = NOW() + 180;
-
-    const data = getKey(key);
-    const failure = getKeyFailure(data, hwid);
-
-    if (failure) {
-      await saveDb().catch(() => {});
-      return res.status(200).json({ e: failure });
-    }
-
-    if (!data.hwid) {
-      data.hwid = hwid;
-      data.updatedAt = NOW();
-    }
-
-    data.executionCount = (data.executionCount || 0) + 1;
-    data.updatedAt = NOW();
-
-    const challengeId = randomHex(24);
-    const challengeKey = randomHex(32);
-
-    db.challenges[challengeId] = {
-      key,
-      hwid,
-      nonce,
-      k: challengeKey,
-      createdAt: NOW(),
-      expiresAt: NOW() + CHALLENGE_TTL,
-      ipHash: sha256(clientIp(req))
+      redeemedAt: 0,
+      usedBy: '',
+      guildId: '',
+      hwid: '',
+      createdAt: NOW()
     };
 
-    audit('client.challenge', {
-      keySuffix: key.slice(-6)
-    });
-
-    try {
-      await saveDb();
-
-      res.json({
-        s: challengeId,
-        k: challengeKey
-      });
-    } catch {
-      res.status(500).json({ e: 'rate' });
-    }
+    keys.push(key);
   }
-);
-
-app.post(
-  '/cdn-cgi/token',
-  rateLimit({ windowMs: 60_000, max: 20 }),
-  async (req, res) => {
-    const { s, hwid, ts, nonce } = req.body || {};
-
-    if (
-      typeof s !== 'string' ||
-      s.length > 128 ||
-      !validHwid(hwid) ||
-      !validClock(ts) ||
-      typeof nonce !== 'string'
-    ) {
-      return res.json({ e: 'rate' });
-    }
-
-    const challenge = db.challenges[s];
-
-    if (
-      !challenge ||
-      challenge.expiresAt <= NOW() ||
-      challenge.hwid !== hwid ||
-      challenge.nonce !== nonce
-    ) {
-      return res.json({ e: 'key' });
-    }
-
-    const data = getKey(challenge.key);
-    const failure = getKeyFailure(data, hwid);
-
-    if (failure) {
-      delete db.challenges[s];
-      await saveDb().catch(() => {});
-      return res.json({ e: failure });
-    }
-
-    // Consume the challenge so it cannot be reused.
-    delete db.challenges[s];
-
-    const activeToken = randomHex(32);
-    const tokenHash = tokenDigest(activeToken);
-
-    db.sessions[tokenHash] = {
-      key: challenge.key,
-      hwid,
-      createdAt: NOW(),
-      expiresAt: NOW() + SESSION_TTL,
-      revoked: false,
-      ipHash: sha256(clientIp(req)),
-      lastSeenAt: NOW()
-    };
-
-    const payload = encryptGcmJson(
-      { ok: true, activeToken },
-      challenge.k
-    );
-
-    audit('client.session.create', {
-      keySuffix: challenge.key.slice(-6)
-    });
-
-    try {
-      await saveDb();
-      res.json(payload);
-    } catch {
-      res.status(500).json({ e: 'rate' });
-    }
-  }
-);
-
-app.post(
-  '/cdn-cgi/validate',
-  rateLimit({ windowMs: 60_000, max: 60 }),
-  async (req, res) => {
-    const {
-      token,
-      hwid,
-      h1,
-      h2,
-      ts
-    } = req.body || {};
-
-    if (!validClock(ts) || !validHwid(hwid)) {
-      return res.json({ ok: false });
-    }
-
-    const live = getLiveSession(token, hwid);
-
-    if (!live) {
-      return res.json({ ok: false });
-    }
-
-    // This is a compatibility check, not proof of client integrity.
-    const seed = crypto.randomInt(1000, 999999);
-    const check = String(
-      customHash(Number(h1) + seed)
-    );
-
-    live.session.lastSeenAt = NOW();
-    live.session.expiresAt = NOW() + SESSION_TTL;
-
-    await saveDb().catch(() => {});
-
-    res.json({
-      ok: true,
-      seed,
-      check
-    });
-  }
-);
-
-app.post(
-  '/cdn-cgi/heartbeat',
-  rateLimit({ windowMs: 60_000, max: 20 }),
-  async (req, res) => {
-    const {
-      token,
-      hwid,
-      ts,
-      ping
-    } = req.body || {};
-
-    if (
-      !validClock(ts) ||
-      !validHwid(hwid) ||
-      !Number.isFinite(Number(ping))
-    ) {
-      return res.json({ alive: false });
-    }
-
-    const live = getLiveSession(token, hwid);
-
-    if (!live) {
-      return res.json({ alive: false });
-    }
-
-    live.session.lastSeenAt = NOW();
-    live.session.expiresAt = NOW() + SESSION_TTL;
-
-    await saveDb().catch(() => {});
-
-    res.json({ alive: true });
-  }
-);
-
-// ----- Owner-only emergency session revocation -----
-
-app.post(
-  '/admin/revoke-session',
-  requireOwner,
-  async (req, res) => {
-    const token = req.body?.token;
-
-    if (
-      typeof token !== 'string' ||
-      token.length > 200
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: 'invalid_token'
-      });
-    }
-
-    const id = tokenDigest(token);
-
-    if (db.sessions[id]) {
-      delete db.sessions[id];
-    }
-
-    audit('session.revoke', {});
-
-    try {
-      await saveDb();
-      res.json({ ok: true });
-    } catch {
-      res.status(500).json({
-        ok: false,
-        error: 'storage_error'
-      });
-    }
-  }
-);
-
-// ----- WebSocket heartbeat -----
-
-server.on('upgrade', (request, socket, head) => {
-  let pathname;
 
   try {
-    pathname = new URL(
-      request.url,
-      'http://localhost'
-    ).pathname;
+    await saveDB();
+    res.json({ ok: true, keys });
   } catch {
-    socket.destroy();
-    return;
+    res.status(500).json({ ok: false, error: 'storage_error' });
   }
-
-  if (pathname !== '/cdn-cgi/ws') {
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(
-    request,
-    socket,
-    head,
-    ws => wss.emit('connection', ws, request)
-  );
 });
 
-wss.on('connection', ws => {
-  wsConnections.add(ws);
+app.post('/keys/:key/redeem', requireBot, async (req, res) => {
+  const keyName = req.params.key;
+  const key = db.keys[keyName];
+  const { userId, guildId } = req.body || {};
 
-  ws.on('message', async raw => {
-    try {
-      const message = JSON.parse(raw.toString());
+  if (!validKey(keyName) || !key || key.active === false) {
+    return res.json({ ok: false, error: 'invalid_key' });
+  }
 
-      if (
-        message.op !== 'PING' ||
-        !validHwid(message.hwid) ||
-        !validClock(message.ts)
-      ) {
-        ws.close(1008, 'invalid');
-        return;
-      }
+  if (!/^\d{5,25}$/.test(String(userId || '')) ||
+      !/^\d{5,25}$/.test(String(guildId || ''))) {
+    return res.status(400).json({ ok: false, error: 'invalid_id' });
+  }
 
-      const live = getLiveSession(
-        message.token,
-        message.hwid
-      );
+  if (keyExpired(key)) {
+    return res.json({ ok: false, error: 'expired_key' });
+  }
 
-      if (!live) {
-        ws.close(1008, 'expired');
-        return;
-      }
+  if (key.usedBy || key.guildId) {
+    return res.json({ ok: false, error: 'already_redeemed' });
+  }
 
-      live.session.lastSeenAt = NOW();
-      live.session.expiresAt = NOW() + SESSION_TTL;
+  key.usedBy = String(userId);
+  key.guildId = String(guildId);
+  key.redeemedAt = NOW();
 
-      ws.send('PONG');
+  try {
+    await saveDB();
+    res.json({ ok: true, duration: key.duration });
+  } catch {
+    res.status(500).json({ ok: false, error: 'storage_error' });
+  }
+});
 
-      saveDb().catch(() => {});
-    } catch {
-      ws.close(1008, 'invalid');
-    }
+app.post('/keys/:key/reset-hwid', requireBot, async (req, res) => {
+  const key = db.keys[req.params.key];
+
+  if (!key) return res.status(404).json({ ok: false, error: 'not_found' });
+
+  key.hwid = '';
+
+  for (const [id, session] of Object.entries(db.sessions)) {
+    if (session.key === req.params.key) delete db.sessions[id];
+  }
+
+  try {
+    await saveDB();
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ ok: false, error: 'storage_error' });
+  }
+});
+
+app.post('/keys/:key/revoke', requireBot, async (req, res) => {
+  const keyName = req.params.key;
+  const key = db.keys[keyName];
+
+  if (!key) return res.status(404).json({ ok: false, error: 'not_found' });
+
+  key.active = false;
+
+  for (const [id, session] of Object.entries(db.sessions)) {
+    if (session.key === keyName) delete db.sessions[id];
+  }
+
+  try {
+    await saveDB();
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ ok: false, error: 'storage_error' });
+  }
+});
+
+// --------------------------------------------------
+// Client authorization: Challenge -> Token -> Validate
+// --------------------------------------------------
+
+app.post('/cdn-cgi/challenge', async (req, res) => {
+  if (db.config.maintenance) {
+    return res.json({ e: 'maintenance' });
+  }
+
+  const { key, hwid, ts, nonce } = req.body || {};
+
+  if (SESSION_SECRET.length < 32) {
+    return res.status(503).json({ e: 'server_config' });
+  }
+
+  if (!validKey(key)) return res.json({ e: 'key' });
+  if (!validHwid(hwid)) return res.json({ e: 'hwid' });
+  if (!validClock(ts)) return res.json({ e: 'rate' });
+
+  if (typeof nonce !== 'string' || !/^[a-fA-F0-9]{16,64}$/.test(nonce)) {
+    return res.json({ e: 'rate' });
+  }
+
+  cleanup();
+
+  const nonceId = sha256(nonce);
+  if (db.nonces[nonceId]) return res.json({ e: 'rate' });
+
+  db.nonces[nonceId] = NOW() + 180;
+
+  const license = db.keys[key];
+  const failure = keyFailure(license, hwid);
+
+  if (failure) {
+    await saveDB().catch(() => {});
+    return res.json({ e: failure });
+  }
+
+  if (!license.hwid) license.hwid = hwid;
+
+  const s = randomHex(24);
+  const k = randomHex(32);
+
+  db.challenges[s] = {
+    key,
+    hwid,
+    nonce,
+    k,
+    expiresAt: NOW() + CHALLENGE_TTL
+  };
+
+  try {
+    await saveDB();
+    res.json({ s, k });
+  } catch {
+    res.status(500).json({ e: 'storage_error' });
+  }
+});
+
+app.post('/cdn-cgi/token', async (req, res) => {
+  const { s, hwid, ts, nonce } = req.body || {};
+
+  if (!validHwid(hwid) || !validClock(ts) ||
+      typeof s !== 'string' || typeof nonce !== 'string') {
+    return res.json({ e: 'rate' });
+  }
+
+  const challenge = db.challenges[s];
+
+  if (!challenge || challenge.expiresAt <= NOW() ||
+      challenge.hwid !== hwid || challenge.nonce !== nonce) {
+    return res.json({ e: 'key' });
+  }
+
+  delete db.challenges[s];
+
+  const license = db.keys[challenge.key];
+  const failure = keyFailure(license, hwid);
+
+  if (failure) {
+    await saveDB().catch(() => {});
+    return res.json({ e: failure });
+  }
+
+  const activeToken = randomHex(32);
+
+  db.sessions[digestToken(activeToken)] = {
+    key: challenge.key,
+    hwid,
+    createdAt: NOW(),
+    expiresAt: NOW() + SESSION_TTL,
+    revoked: false
+  };
+
+  try {
+    await saveDB();
+    res.json(encryptToken({ ok: true, activeToken }, challenge.k));
+  } catch {
+    res.status(500).json({ e: 'storage_error' });
+  }
+});
+
+app.post('/cdn-cgi/validate', async (req, res) => {
+  const { token, hwid, h1, ts } = req.body || {};
+
+  if (!validHwid(hwid) || !validClock(ts)) {
+    return res.json({ ok: false, error: 'invalid_request' });
+  }
+
+  const live = liveSession(token, hwid);
+
+  if (!live) return res.json({ ok: false, error: 'invalid_session' });
+
+  const seed = crypto.randomInt(1000, 999999);
+  const check = String(customHash(Number(h1) + seed));
+
+  live.session.expiresAt = NOW() + SESSION_TTL;
+
+  await saveDB().catch(() => {});
+
+  res.json({
+    ok: true,
+    seed,
+    check,
+    expiresAt: live.session.expiresAt
   });
-
-  ws.on('close', () => wsConnections.delete(ws));
-  ws.on('error', () => wsConnections.delete(ws));
 });
 
-// ----- Error handling -----
+app.post('/cdn-cgi/heartbeat', async (req, res) => {
+  const { token, hwid, ts, ping } = req.body || {};
+
+  if (!validHwid(hwid) || !validClock(ts) ||
+      !Number.isFinite(Number(ping))) {
+    return res.json({ alive: false, error: 'invalid_request' });
+  }
+
+  const live = liveSession(token, hwid);
+
+  if (!live) return res.json({ alive: false, error: 'invalid_session' });
+
+  live.session.expiresAt = NOW() + SESSION_TTL;
+
+  await saveDB().catch(() => {});
+
+  res.json({
+    alive: true,
+    expiresAt: live.session.expiresAt
+  });
+});
+
+// --------------------------------------------------
+// Owner: revoke an active session
+// --------------------------------------------------
+
+app.post('/admin/revoke-session', requireOwner, async (req, res) => {
+  const token = req.body?.token;
+
+  if (typeof token !== 'string' || !token) {
+    return res.status(400).json({ ok: false, error: 'invalid_token' });
+  }
+
+  delete db.sessions[digestToken(token)];
+
+  try {
+    await saveDB();
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ ok: false, error: 'storage_error' });
+  }
+});
+
+// --------------------------------------------------
+// Errors
+// --------------------------------------------------
 
 app.use((_req, res) => {
-  res.status(404).json({
-    ok: false,
-    error: 'not_found'
-  });
+  res.status(404).json({ ok: false, error: 'not_found' });
 });
 
 app.use((err, _req, res, _next) => {
-  if (
-    err instanceof SyntaxError &&
-    'body' in err
-  ) {
-    return res.status(400).json({
-      ok: false,
-      error: 'invalid_json'
-    });
+  if (err instanceof SyntaxError) {
+    return res.status(400).json({ ok: false, error: 'invalid_json' });
   }
 
-  if (err?.type === 'entity.too.large') {
-    return res.status(413).json({
-      ok: false,
-      error: 'body_too_large'
-    });
-  }
+  console.error('[RainX]', err.message);
+  res.status(500).json({ ok: false, error: 'internal_error' });
+});
 
+if (BOT_SECRET.length < 24 ||
+    OWNER_SECRET.length < 24 ||
+    SESSION_SECRET.length < 32) {
   console.error(
-    '[server error]',
-    err?.message || 'unknown'
+    'Set BOT_SECRET (24+ chars), OWNER_SECRET (24+ chars), ' +
+    'and SESSION_SECRET (32+ chars) in environment variables.'
   );
+}
 
-  res.status(500).json({
-    ok: false,
-    error: 'internal_error'
-  });
-});
+loadDB();
 
-// ----- Startup and graceful shutdown -----
+setInterval(() => {
+  cleanup();
+  saveDB().catch(err => console.error('Cleanup save error:', err.message));
+}, 60_000).unref();
 
-loadDb();
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(
-    `[RainX API Pro] listening on ${PORT}; data=${DATA_FILE}`
-  );
-});
-
-process.on('SIGTERM', async () => {
-  try {
-    await saveDb();
-  } catch (error) {
-    console.error(
-      '[shutdown] save failed:',
-      error.message
-    );
-  }
-
-  server.close(() => process.exit(0));
-
-  setTimeout(() => process.exit(1), 8000).unref();
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[RainX API] Listening on port ${PORT}`);
 });
